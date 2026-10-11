@@ -3,7 +3,6 @@
 // IWYU pragma: friend "rlbox_.*\.hpp"
 
 #include <algorithm>
-#include <atomic>
 #ifdef RLBOX_MEASURE_TRANSITION_TIMES
 #  include <chrono>
 #endif
@@ -118,6 +117,8 @@ private:
   // In general, we leave it up to the user to ensure these APIs are never
   // called prior to sandbox construction or after destruction. We perform some
   // conservative sanity checks, where they would not add too much overhead.
+  // Creation and destruction must be externally synchronized with all other
+  // accesses to this sandbox; the lifecycle state is not atomic.
   enum class Sandbox_Status
   {
     NOT_CREATED,
@@ -125,7 +126,7 @@ private:
     CREATED,
     CLEANING_UP
   };
-  std::atomic<Sandbox_Status> sandbox_created = Sandbox_Status::NOT_CREATED;
+  Sandbox_Status sandbox_created = Sandbox_Status::NOT_CREATED;
 
   std::mutex callback_lock;
   std::vector<void*> callback_keys;
@@ -309,7 +310,7 @@ private:
   {
     // Silently swallowing the failure is better here as RAII types may try to
     // cleanup callbacks after sandbox destruction
-    if (sandbox_created.load() != Sandbox_Status::CREATED) {
+    if (sandbox_created != Sandbox_Status::CREATED) {
       return;
     }
 
@@ -411,13 +412,10 @@ public:
       RLBOX_UNUSED(val);
     }
 #endif
-    auto expected = Sandbox_Status::NOT_CREATED;
-    bool success = sandbox_created.compare_exchange_strong(
-      expected, Sandbox_Status::INITIALIZING /* desired */);
     detail::dynamic_check(
-      success,
-      "create_sandbox called when sandbox already created/is being "
-      "created concurrently");
+      sandbox_created == Sandbox_Status::NOT_CREATED,
+      "create_sandbox called when sandbox already created/is being created");
+    sandbox_created = Sandbox_Status::INITIALIZING;
 
     using T_Result = rlbox::detail::polyfill::invoke_result_t<
       decltype(impl_create_sandbox_helper<T_Args...>),
@@ -436,7 +434,7 @@ public:
     }
 
     if (created) {
-      sandbox_created.store(Sandbox_Status::CREATED);
+      sandbox_created = Sandbox_Status::CREATED;
       RLBOX_ACQUIRE_UNIQUE_GUARD(lock, sandbox_list_lock);
       sandbox_list.push_back(this);
     }
@@ -449,14 +447,10 @@ public:
    */
   inline auto destroy_sandbox()
   {
-    auto expected = Sandbox_Status::CREATED;
-    bool success = sandbox_created.compare_exchange_strong(
-      expected, Sandbox_Status::CLEANING_UP /* desired */);
-
     detail::dynamic_check(
-      success,
-      "destroy_sandbox called without sandbox creation/is being "
-      "destroyed concurrently");
+      sandbox_created == Sandbox_Status::CREATED,
+      "destroy_sandbox called without sandbox creation/is being destroyed");
+    sandbox_created = Sandbox_Status::CLEANING_UP;
 
     {
       RLBOX_ACQUIRE_UNIQUE_GUARD(lock, sandbox_list_lock);
@@ -467,7 +461,7 @@ public:
       sandbox_list.erase(el_ref);
     }
 
-    sandbox_created.store(Sandbox_Status::NOT_CREATED);
+    sandbox_created = Sandbox_Status::NOT_CREATED;
     return this->impl_destroy_sandbox();
   }
 
@@ -555,7 +549,7 @@ public:
   {
     // Silently swallowing the failure is better here as RAII types may try to
     // malloc after sandbox destruction
-    if (sandbox_created.load() != Sandbox_Status::CREATED) {
+    if (sandbox_created != Sandbox_Status::CREATED) {
       return tainted<T*, T_Sbx>::internal_factory(nullptr);
     }
 
@@ -607,7 +601,7 @@ public:
   {
     // Silently swallowing the failure is better here as RAII types may try to
     // free after sandbox destruction
-    if (sandbox_created.load() != Sandbox_Status::CREATED) {
+    if (sandbox_created != Sandbox_Status::CREATED) {
       return;
     }
 
@@ -945,7 +939,7 @@ public:
     else
     {
       detail::dynamic_check(
-        sandbox_created.load() == Sandbox_Status::CREATED,
+        sandbox_created == Sandbox_Status::CREATED,
         "register_callback called without sandbox creation");
 
       // Need unique key for each callback we register - just use the func addr
